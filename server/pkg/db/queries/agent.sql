@@ -801,25 +801,32 @@ UPDATE agent SET status = $2, updated_at = now()
 WHERE id = $1
 RETURNING *;
 
--- name: CancelActiveRetryChildrenByParent :many
--- Cancels active retry children spawned from a parent task that was prematurely
--- marked failed by a sweeper. Called when the parent task is reclaimed by a
--- late terminal report from the daemon, so the retry child doesn't produce
--- duplicate output or comments. Only cancels immediate children (grandchildren
--- are handled transitively if the child itself is cancelled before failing).
+-- name: CancelActiveRetryDescendantsByParent :many
+-- Cancels active retry descendants (children, grandchildren, etc.) spawned from a parent task
+-- that was prematurely marked failed by a sweeper.
+WITH RECURSIVE retry_tree(id) AS (
+    SELECT q1.id FROM agent_task_queue q1 WHERE q1.parent_task_id = $1
+    UNION ALL
+    SELECT q2.id FROM agent_task_queue q2
+    INNER JOIN retry_tree t ON q2.parent_task_id = t.id
+)
 UPDATE agent_task_queue
 SET status = 'cancelled', completed_at = now(), prepare_lease_expires_at = NULL
-WHERE parent_task_id = $1 AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
+WHERE id IN (SELECT id FROM retry_tree) AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
 RETURNING *;
 
--- name: HasCompletedRetryChildByParent :one
--- Returns true if a retry child for the given parent has already reached a
--- terminal completed state. Used by the reclaim path to decide whether the
--- late parent report should be accepted: if a retry child already completed
--- successfully, the child's result is authoritative and the parent reclaim
--- must be rejected to avoid two competing terminal results.
+-- name: HasCompletedRetryDescendantsByParent :one
+-- Returns true if any retry descendant (child, grandchild, etc.) for the given parent
+-- has already reached a terminal completed state.
+WITH RECURSIVE retry_tree(id) AS (
+    SELECT q1.id FROM agent_task_queue q1 WHERE q1.parent_task_id = $1
+    UNION ALL
+    SELECT q2.id FROM agent_task_queue q2
+    INNER JOIN retry_tree t ON q2.parent_task_id = t.id
+)
 SELECT count(*) > 0 AS has_completed FROM agent_task_queue
-WHERE parent_task_id = $1 AND status = 'completed';
+WHERE id IN (SELECT id FROM retry_tree) AND status = 'completed';
+
 
 -- name: RefreshAgentStatusFromTasks :one
 UPDATE agent AS a

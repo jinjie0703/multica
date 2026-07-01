@@ -149,7 +149,7 @@ func (m *mockDBTX) QueryRow(_ context.Context, sql string, args ...interface{}) 
 	if strings.Contains(sql, "UPDATE agent AS a") {
 		return &mockAgentRow{}
 	}
-	if strings.Contains(sql, "HasCompletedRetryChildByParent") {
+	if strings.Contains(sql, "HasCompletedRetryDescendantsByParent") {
 		return &mockBoolRow{val: m.completedRetryChild}
 	}
 	if strings.Contains(sql, "SELECT count(*) > 0") || strings.Contains(sql, "HasSquadLeaderNoActionEvaluationForTask") || strings.Contains(sql, "HasAgentCommentedSince") {
@@ -458,6 +458,7 @@ func TestCompleteTask_ReclaimCancelsRetryChild(t *testing.T) {
 	}
 }
 
+
 func TestCompleteTask_ReclaimRejectedIfRetryChildCompleted(t *testing.T) {
 	taskID := testUUID(1)
 	agentID := testUUID(2)
@@ -491,4 +492,141 @@ func TestCompleteTask_ReclaimRejectedIfRetryChildCompleted(t *testing.T) {
 		t.Errorf("expected parent status to remain 'failed' when retry child completed, got %q", got.Status)
 	}
 }
+
+func TestCompleteTask_ReclaimCascadesDescendants(t *testing.T) {
+	taskID := testUUID(1)
+	agentID := testUUID(2)
+	childTaskID := testUUID(4)
+	grandchildTaskID := testUUID(5)
+
+	parent := db.AgentTaskQueue{
+		ID:            taskID,
+		AgentID:       agentID,
+		Status:        "failed",
+		Error:         pgtype.Text{String: "task timed out", Valid: true},
+		FailureReason: pgtype.Text{String: "timeout", Valid: true},
+	}
+	
+	// Child B is already failed
+	child := db.AgentTaskQueue{
+		ID:           childTaskID,
+		AgentID:      agentID,
+		Status:       "failed",
+		ParentTaskID: taskID,
+	}
+	
+	// Grandchild C is active running
+	grandchild := db.AgentTaskQueue{
+		ID:           grandchildTaskID,
+		AgentID:      agentID,
+		Status:       "running",
+		ParentTaskID: childTaskID,
+	}
+
+	mock := &mockDBTX{
+		task:          parent,
+		retryChildren: []db.AgentTaskQueue{child, grandchild},
+	}
+	bus := events.New()
+	var cancelledEvents []events.Event
+	bus.Subscribe("task:cancelled", func(e events.Event) {
+		cancelledEvents = append(cancelledEvents, e)
+	})
+
+	svc := &TaskService{
+		Queries: db.New(mock),
+		Bus:     bus,
+	}
+
+	resultPayload := []byte(`{"output": "late success output"}`)
+	got, err := svc.CompleteTask(context.Background(), taskID, resultPayload, "sess-123", "/work/dir")
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if got.Status != "completed" {
+		t.Errorf("expected parent status 'completed', got %q", got.Status)
+	}
+
+	// Verify that grandchild was cancelled recursively, while child remains failed
+	var grandchildCancelled bool
+	for _, c := range mock.retryChildren {
+		if c.ID == grandchildTaskID && c.Status == "cancelled" {
+			grandchildCancelled = true
+		}
+	}
+	if !grandchildCancelled {
+		t.Errorf("expected grandchild to be cancelled recursively")
+	}
+}
+
+// trackOrderDBTX verifies the exact execution sequence of queries in the transaction
+type trackOrderDBTX struct {
+	mockDBTX
+	callSequence []string
+}
+
+func (m *trackOrderDBTX) Query(ctx context.Context, sql string, args ...interface{}) (pgx.Rows, error) {
+	if strings.Contains(sql, "CancelActiveRetryDescendantsByParent") {
+		m.callSequence = append(m.callSequence, "Cancel")
+	}
+	return m.mockDBTX.Query(ctx, sql, args...)
+}
+
+func (m *trackOrderDBTX) QueryRow(ctx context.Context, sql string, args ...interface{}) pgx.Row {
+	if strings.Contains(sql, "HasCompletedRetryDescendantsByParent") {
+		m.callSequence = append(m.callSequence, "CheckCompleted")
+	} else if strings.Contains(sql, "CompleteOrReclaimAgentTask") {
+		m.callSequence = append(m.callSequence, "ReclaimParent")
+	}
+	return m.mockDBTX.QueryRow(ctx, sql, args...)
+}
+
+func TestCompleteTask_ReclaimRacePreemption(t *testing.T) {
+	taskID := testUUID(1)
+	agentID := testUUID(2)
+
+	parent := db.AgentTaskQueue{
+		ID:            taskID,
+		AgentID:       agentID,
+		Status:        "failed",
+		Error:         pgtype.Text{String: "task timed out", Valid: true},
+		FailureReason: pgtype.Text{String: "timeout", Valid: true},
+	}
+
+	mock := &trackOrderDBTX{
+		mockDBTX: mockDBTX{
+			task: parent,
+		},
+		callSequence: []string{},
+	}
+	svc := &TaskService{
+		Queries: db.New(mock),
+		Bus:     events.New(),
+	}
+
+	resultPayload := []byte(`{"output": "late success output"}`)
+	_, err := svc.CompleteTask(context.Background(), taskID, resultPayload, "sess-123", "/work/dir")
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+
+	// Assert the strict sequence: Cancel (locks rows) -> CheckCompleted -> ReclaimParent
+	expectedSequence := []string{"Cancel", "CheckCompleted", "ReclaimParent"}
+	if len(mock.callSequence) < 3 {
+		t.Fatalf("expected at least 3 sequence calls, got %v", mock.callSequence)
+	}
+	// Extract our core 3 calls
+	sequence := []string{}
+	for _, call := range mock.callSequence {
+		if call == "Cancel" || call == "CheckCompleted" || call == "ReclaimParent" {
+			sequence = append(sequence, call)
+		}
+	}
+	for i, name := range expectedSequence {
+		if i >= len(sequence) || sequence[i] != name {
+			t.Errorf("at index %d: expected %q, got %q (full sequence: %v)", i, name, sequence[i], sequence)
+		}
+	}
+}
+
 

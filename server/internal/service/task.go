@@ -1370,14 +1370,23 @@ func (s *TaskService) CompleteTask(ctx context.Context, taskID pgtype.UUID, resu
 	var task db.AgentTaskQueue
 	var cancelledChildren []db.AgentTaskQueue
 	if err := s.runInTx(ctx, func(qtx *db.Queries) error {
-		hasCompleted, err := qtx.HasCompletedRetryChildByParent(ctx, taskID)
+		// 1. Lock and cancel active descendants first to eliminate the race window
+		var err error
+		cancelledChildren, err = qtx.CancelActiveRetryDescendantsByParent(ctx, taskID)
 		if err != nil {
-			return fmt.Errorf("check completed retry child: %w", err)
-		}
-		if hasCompleted {
-			return pgx.ErrNoRows
+			return fmt.Errorf("cancel active retry descendants: %w", err)
 		}
 
+		// 2. Check if any descendant has completed
+		hasCompleted, err := qtx.HasCompletedRetryDescendantsByParent(ctx, taskID)
+		if err != nil {
+			return fmt.Errorf("check completed retry descendants: %w", err)
+		}
+		if hasCompleted {
+			return pgx.ErrNoRows // Abort parent reclaim
+		}
+
+		// 3. Reclaim the parent task
 		t, err := qtx.CompleteOrReclaimAgentTask(ctx, db.CompleteOrReclaimAgentTaskParams{
 			ID:        taskID,
 			Result:    result,
@@ -1389,10 +1398,6 @@ func (s *TaskService) CompleteTask(ctx context.Context, taskID pgtype.UUID, resu
 		}
 		task = t
 
-		cancelledChildren, err = qtx.CancelActiveRetryChildrenByParent(ctx, taskID)
-		if err != nil {
-			return fmt.Errorf("cancel active retry children: %w", err)
-		}
 
 		if t.ChatSessionID.Valid {
 			// Pin the chat_session's runtime_id alongside the session_id so the
@@ -1583,14 +1588,23 @@ func (s *TaskService) FailTask(ctx context.Context, taskID pgtype.UUID, errMsg, 
 	var task db.AgentTaskQueue
 	var cancelledChildren []db.AgentTaskQueue
 	if err := s.runInTx(ctx, func(qtx *db.Queries) error {
-		hasCompleted, err := qtx.HasCompletedRetryChildByParent(ctx, taskID)
+		// 1. Lock and cancel active descendants first to eliminate the race window
+		var err error
+		cancelledChildren, err = qtx.CancelActiveRetryDescendantsByParent(ctx, taskID)
 		if err != nil {
-			return fmt.Errorf("check completed retry child: %w", err)
-		}
-		if hasCompleted {
-			return pgx.ErrNoRows
+			return fmt.Errorf("cancel active retry descendants: %w", err)
 		}
 
+		// 2. Check if any descendant has completed
+		hasCompleted, err := qtx.HasCompletedRetryDescendantsByParent(ctx, taskID)
+		if err != nil {
+			return fmt.Errorf("check completed retry descendants: %w", err)
+		}
+		if hasCompleted {
+			return pgx.ErrNoRows // Abort parent reclaim
+		}
+
+		// 3. Reclaim the parent task
 		t, err := qtx.FailOrReclaimAgentTask(ctx, db.FailOrReclaimAgentTaskParams{
 			ID:            taskID,
 			Error:         pgtype.Text{String: errMsg, Valid: true},
@@ -1603,10 +1617,6 @@ func (s *TaskService) FailTask(ctx context.Context, taskID pgtype.UUID, errMsg, 
 		}
 		task = t
 
-		cancelledChildren, err = qtx.CancelActiveRetryChildrenByParent(ctx, taskID)
-		if err != nil {
-			return fmt.Errorf("cancel active retry children: %w", err)
-		}
 
 		// Keep resume-unsafe sessions on the task row for observability, but
 		// do not promote them to the chat-level resume pointer.

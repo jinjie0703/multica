@@ -174,6 +174,74 @@ func (q *Queries) ArchiveAgentsByRuntime(ctx context.Context, arg ArchiveAgentsB
 	return items, nil
 }
 
+const cancelActiveRetryDescendantsByParent = `-- name: CancelActiveRetryDescendantsByParent :many
+WITH RECURSIVE retry_tree(id) AS (
+    SELECT q1.id FROM agent_task_queue q1 WHERE q1.parent_task_id = $1
+    UNION ALL
+    SELECT q2.id FROM agent_task_queue q2
+    INNER JOIN retry_tree t ON q2.parent_task_id = t.id
+)
+UPDATE agent_task_queue
+SET status = 'cancelled', completed_at = now(), prepare_lease_expires_at = NULL
+WHERE id IN (SELECT id FROM retry_tree) AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
+RETURNING id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id, chat_session_id, autopilot_run_id, attempt, max_attempts, parent_task_id, failure_reason, trigger_summary, force_fresh_session, is_leader_task, wait_reason, initiator_user_id, handoff_note, prepare_lease_expires_at, squad_id, escalation_for_task_id, fire_at
+`
+
+// Cancels active retry descendants (children, grandchildren, etc.) spawned from a parent task
+// that was prematurely marked failed by a sweeper.
+func (q *Queries) CancelActiveRetryDescendantsByParent(ctx context.Context, parentTaskID pgtype.UUID) ([]AgentTaskQueue, error) {
+	rows, err := q.db.Query(ctx, cancelActiveRetryDescendantsByParent, parentTaskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []AgentTaskQueue{}
+	for rows.Next() {
+		var i AgentTaskQueue
+		if err := rows.Scan(
+			&i.ID,
+			&i.AgentID,
+			&i.IssueID,
+			&i.Status,
+			&i.Priority,
+			&i.DispatchedAt,
+			&i.StartedAt,
+			&i.CompletedAt,
+			&i.Result,
+			&i.Error,
+			&i.CreatedAt,
+			&i.Context,
+			&i.RuntimeID,
+			&i.SessionID,
+			&i.WorkDir,
+			&i.TriggerCommentID,
+			&i.ChatSessionID,
+			&i.AutopilotRunID,
+			&i.Attempt,
+			&i.MaxAttempts,
+			&i.ParentTaskID,
+			&i.FailureReason,
+			&i.TriggerSummary,
+			&i.ForceFreshSession,
+			&i.IsLeaderTask,
+			&i.WaitReason,
+			&i.InitiatorUserID,
+			&i.HandoffNote,
+			&i.PrepareLeaseExpiresAt,
+			&i.SquadID,
+			&i.EscalationForTaskID,
+			&i.FireAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const cancelAgentTask = `-- name: CancelAgentTask :one
 UPDATE agent_task_queue
 SET status = 'cancelled', completed_at = now(), prepare_lease_expires_at = NULL
@@ -2227,6 +2295,26 @@ func (q *Queries) HasActiveTaskForIssue(ctx context.Context, issueID pgtype.UUID
 	return has_active, err
 }
 
+const hasCompletedRetryDescendantsByParent = `-- name: HasCompletedRetryDescendantsByParent :one
+WITH RECURSIVE retry_tree(id) AS (
+    SELECT q1.id FROM agent_task_queue q1 WHERE q1.parent_task_id = $1
+    UNION ALL
+    SELECT q2.id FROM agent_task_queue q2
+    INNER JOIN retry_tree t ON q2.parent_task_id = t.id
+)
+SELECT count(*) > 0 AS has_completed FROM agent_task_queue
+WHERE id IN (SELECT id FROM retry_tree) AND status = 'completed'
+`
+
+// Returns true if any retry descendant (child, grandchild, etc.) for the given parent
+// has already reached a terminal completed state.
+func (q *Queries) HasCompletedRetryDescendantsByParent(ctx context.Context, parentTaskID pgtype.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, hasCompletedRetryDescendantsByParent, parentTaskID)
+	var has_completed bool
+	err := row.Scan(&has_completed)
+	return has_completed, err
+}
+
 const hasPendingTaskForIssue = `-- name: HasPendingTaskForIssue :one
 SELECT count(*) > 0 AS has_pending FROM agent_task_queue
 WHERE issue_id = $1 AND status IN ('queued', 'dispatched')
@@ -3510,86 +3598,4 @@ type UpdateAgentTaskSessionParams struct {
 func (q *Queries) UpdateAgentTaskSession(ctx context.Context, arg UpdateAgentTaskSessionParams) error {
 	_, err := q.db.Exec(ctx, updateAgentTaskSession, arg.ID, arg.SessionID, arg.WorkDir)
 	return err
-}
-
-const cancelActiveRetryChildrenByParent = `-- name: CancelActiveRetryChildrenByParent :many
-UPDATE agent_task_queue
-SET status = 'cancelled', completed_at = now(), prepare_lease_expires_at = NULL
-WHERE parent_task_id = $1 AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
-RETURNING id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id, chat_session_id, autopilot_run_id, attempt, max_attempts, parent_task_id, failure_reason, trigger_summary, force_fresh_session, is_leader_task, wait_reason, initiator_user_id, handoff_note, prepare_lease_expires_at, squad_id, escalation_for_task_id, fire_at
-`
-
-// Cancels active retry children spawned from a parent task that was prematurely
-// marked failed by a sweeper. Called when the parent task is reclaimed by a
-// late terminal report from the daemon, so the retry child doesn't produce
-// duplicate output or comments. Only cancels immediate children (grandchildren
-// are handled transitively if the child itself is cancelled before failing).
-func (q *Queries) CancelActiveRetryChildrenByParent(ctx context.Context, parentTaskID pgtype.UUID) ([]AgentTaskQueue, error) {
-	rows, err := q.db.Query(ctx, cancelActiveRetryChildrenByParent, parentTaskID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []AgentTaskQueue{}
-	for rows.Next() {
-		var i AgentTaskQueue
-		if err := rows.Scan(
-			&i.ID,
-			&i.AgentID,
-			&i.IssueID,
-			&i.Status,
-			&i.Priority,
-			&i.DispatchedAt,
-			&i.StartedAt,
-			&i.CompletedAt,
-			&i.Result,
-			&i.Error,
-			&i.CreatedAt,
-			&i.Context,
-			&i.RuntimeID,
-			&i.SessionID,
-			&i.WorkDir,
-			&i.TriggerCommentID,
-			&i.ChatSessionID,
-			&i.AutopilotRunID,
-			&i.Attempt,
-			&i.MaxAttempts,
-			&i.ParentTaskID,
-			&i.FailureReason,
-			&i.TriggerSummary,
-			&i.ForceFreshSession,
-			&i.IsLeaderTask,
-			&i.WaitReason,
-			&i.InitiatorUserID,
-			&i.HandoffNote,
-			&i.PrepareLeaseExpiresAt,
-			&i.SquadID,
-			&i.EscalationForTaskID,
-			&i.FireAt,
-		); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const hasCompletedRetryChildByParent = `-- name: HasCompletedRetryChildByParent :one
-SELECT count(*) > 0 AS has_completed FROM agent_task_queue
-WHERE parent_task_id = $1 AND status = 'completed'
-`
-
-// Returns true if a retry child for the given parent has already reached a
-// terminal completed state. Used by the reclaim path to decide whether the
-// late parent report should be accepted: if a retry child already completed
-// successfully, the child's result is authoritative and the parent reclaim
-// must be rejected to avoid two competing terminal results.
-func (q *Queries) HasCompletedRetryChildByParent(ctx context.Context, parentTaskID pgtype.UUID) (bool, error) {
-	row := q.db.QueryRow(ctx, hasCompletedRetryChildByParent, parentTaskID)
-	var has_completed bool
-	err := row.Scan(&has_completed)
-	return has_completed, err
 }
